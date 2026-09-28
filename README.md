@@ -1,0 +1,265 @@
+# hashfiles-lint
+
+Finds GitHub Actions `hashFiles()` patterns that match no files in the working tree.
+
+```sh
+npx hashfiles-lint .
+```
+
+```
+.github/workflows/ci.yml:41: error [matches-nothing] hashFiles('composer.lock') matches no files — it resolves to '' and the cache key becomes constant.
+```
+
+## Why
+
+`hashFiles(pattern)` returns an empty string when nothing matches:
+
+> If the `path` pattern does not match any files, this returns an empty string.
+
+— [docs.github.com, Expressions reference](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#hashfiles)
+
+A cache key built from an empty `hashFiles()` result is a constant string. `actions/cache`
+then restores an exact match on every run, never re-saves, and the cache silently stops
+tracking the file it was supposed to key on. A real report of exactly this
+(hoiekim/inbox#985):
+
+> Both dependency-cache steps in CI key on `hashFiles('bun.lockb')`. This repository's
+> lockfile is `bun.lock`. `hashFiles` returns an empty string when no file matches, so
+> the cache key is the constant literal `bun-` on every run and never changes when
+> dependencies do. [...] Builds still pass [...] so this is a caching-efficiency defect,
+> not a correctness one. The cost is that the cache stops doing its job as dependencies
+> move, silently, with no failing signal.
+
+Neither of the two workflow linters this project checked catches it. Built a one-line
+fixture with the same `bun.lockb`/`bun.lock` mismatch (`hashFiles('bun.lockb')` where only
+`bun.lock` exists) and ran both against it:
+
+Measured: `actionlint .github/workflows/test.yml`
+
+```
+(no output, exit code 0)
+```
+
+Measured: `zizmor .github/workflows/test.yml` (findings unrelated to hashFiles omitted from
+this quote; the tool does not have a rule for it — see full output below)
+
+```
+7 findings (3 suppressed, 1 unsafe fixes): 0 informational, 0 low, 2 medium, 2 high
+```
+
+Full zizmor output on that fixture, unedited:
+
+```
+ INFO zizmor: 🌈 zizmor v1.30.1
+ WARN audit: zizmor: zizmor is running in offline mode by default; some audits and auto-fixes will not be available. see https://docs.zizmor.sh/usage/#operating-modes for details
+ INFO audit: zizmor: 🌈 completed .github/workflows/test.yml
+warning[artipacked]: credential persistence through GitHub Actions artifacts
+ --> .github/workflows/test.yml:7:9
+  |
+7 |       - uses: actions/checkout@v4
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^ does not set persist-credentials: false
+  |
+  = note: audit confidence → Low
+  = note: this finding has an auto-fix
+  = help: audit documentation → https://docs.zizmor.sh/audits/#artipacked
+
+warning[excessive-permissions]: overly broad permissions
+  --> .github/workflows/test.yml:4:3
+   |
+ 4 | /   build:
+ 5 | |     runs-on: ubuntu-latest
+ 6 | |     steps:
+ 7 | |       - uses: actions/checkout@v4
+...  |
+11 | |           key: deps-${{ hashFiles('bun.lockb') }}
+12 | |       - run: echo hi
+   | |                     ^
+   | |                     |
+   | |_____________________this job
+   |                       default permissions used due to no permissions: block
+   |
+   = note: audit confidence → Medium
+   = help: audit documentation → https://docs.zizmor.sh/audits/#excessive-permissions
+
+error[unpinned-uses]: unpinned action reference
+ --> .github/workflows/test.yml:7:15
+  |
+7 |       - uses: actions/checkout@v4
+  |               ^^^^^^^^^^^^^^^^^^^ action is not pinned to a hash (required by blanket policy)
+  |
+  = note: audit confidence → High
+  = help: audit documentation → https://docs.zizmor.sh/audits/#unpinned-uses
+
+error[unpinned-uses]: unpinned action reference
+ --> .github/workflows/test.yml:8:15
+  |
+8 |       - uses: actions/cache@v4
+  |               ^^^^^^^^^^^^^^^^ action is not pinned to a hash (required by blanket policy)
+  |
+  = note: audit confidence → High
+  = help: audit documentation → https://docs.zizmor.sh/audits/#unpinned-uses
+
+7 findings (3 suppressed, 1 unsafe fixes): 0 informational, 0 low, 2 medium, 2 high
+```
+
+Both flag real, unrelated problems (unpinned actions, missing `persist-credentials`,
+default permissions) but neither says a word about the cache key that will never
+change. Also checked `Ayyankhan101/PipeCheck` (an npm-published CI auditor); it has a
+rule for a cache `key:` that never mentions `hashFiles` at all, but nothing that checks
+whether the pattern inside an existing `hashFiles()` call resolves to anything.
+
+Measured on 8 real GitHub repositories that use `actions/cache` with `hashFiles()`
+(cloned at depth 1): 7 came back clean, 1 (`CouscousPHP/Couscous`) had a genuine hit —
+`composer.lock` is listed in that repo's own `.gitignore` and so is never present in the
+checkout at the point the cache step runs. All three of that repo's `hashFiles('composer.lock')`
+call sites are the same bug in three jobs.
+
+## Installation
+
+```sh
+npm install --save-dev hashfiles-lint
+```
+
+Node >= 20.6.
+
+## Usage
+
+### Lint a repository
+
+```sh
+npx hashfiles-lint .
+```
+
+Scans `.github/workflows/*.yml` and every `action.yml`/`action.yaml` composite action
+under the given directory (skipping `node_modules` and `.git`).
+
+### Lint a single file
+
+```sh
+npx hashfiles-lint .github/workflows/ci.yml
+```
+
+`--workspace <dir>` sets the root patterns resolve against (mirrors `GITHUB_WORKSPACE`);
+it defaults to the scanned directory, or the current directory when scanning a single file.
+
+### In CI
+
+```yaml
+- run: npx hashfiles-lint . --format github
+```
+
+`--format github` prints `::error`/`::warning`/`::notice` workflow commands so findings
+show up as annotations on the run.
+
+## Reference
+
+### CLI
+
+```
+hashfiles-lint [path] [--format text|json|github] [--workspace <dir>]
+```
+
+| Flag | Values | Default | Description |
+| --- | --- | --- | --- |
+| `path` | directory or file | `.` | What to scan. |
+| `--format` | `text`, `json`, `github` | `text` | Output format. |
+| `--workspace` | directory | `path` (or cwd for a single file) | Root patterns resolve against. |
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Clean — no findings. |
+| 1 | Findings (of any severity). |
+| 2 | Could not analyse the input (unreadable file, invalid YAML). |
+
+### Rules
+
+| Rule | Severity | Trigger |
+| --- | --- | --- |
+| `matches-nothing` | error | Every pattern in a `hashFiles(...)` call is a static string literal, and the call matches no file under the workspace. |
+| `matches-only-ignored` | warning | The call matches at least one file, but every match is under `.git` or `node_modules` — `@actions/glob` does not exclude either by default. |
+| `vendored-leading-glob` | info | A pattern starting with `**/` matches both an intended file and a copy under `node_modules`, `vendor`, or `third_party`/`third-party`. |
+| `static-cache-key` | warning | An `actions/cache` step's `key:` has no `${{ }}` expression at all — a fixed string, never invalidated. |
+| `lockfile-manager-mismatch` | warning | A pattern's literal basename is a lockfile (`yarn.lock`, `pnpm-lock.yaml`, `package-lock.json`/`npm-shrinkwrap.json`, `bun.lock`/`bun.lockb`) for a package manager other than the one a `setup-node`/`pnpm/action-setup`/`setup-bun` step or the repo's `package.json` `packageManager` field indicates. Skipped when the signals disagree or there is no signal. |
+| `invalid-pattern` | warning | A pattern is malformed in a way `@actions/glob` itself rejects (e.g. a `..` segment) and could not be evaluated. |
+
+Any `hashFiles()` call with at least one non-literal argument (a context reference,
+`format()`, etc.) is skipped for `matches-nothing`/`matches-only-ignored`/
+`vendored-leading-glob` — the match set cannot be determined statically — but is still
+checked by `lockfile-manager-mismatch` for its literal arguments.
+
+### Library
+
+```ts
+import { lintPath } from 'hashfiles-lint';
+
+const report = await lintPath('.');
+// report.findings: Finding[]
+// report.errors: { file, message }[]   — files that could not be parsed
+// report.scannedFiles: string[]
+```
+
+## How it works
+
+Each workflow/action YAML file is parsed with the `yaml` package into a `Document`, and
+walked to find every step (any map with a `uses` or `run` key — this covers both
+`jobs.*.steps[]` and a composite action's `runs.steps[]`). Any string-valued scalar
+containing `hashFiles(` is parsed as a GitHub Actions expression call: parenthesis/
+string-aware, so `hashFiles(format('{0}/x', matrix.y))` is recognized as one call with one
+non-literal argument, not confused by the nested parens.
+
+For a call whose patterns are all literal strings, the patterns are handed to
+`@actions/glob` — but with the runner's own options, not `@actions/glob`'s defaults.
+`actions/runner`'s `hashFiles()` does not call `@actions/glob`'s own `hashFiles()` helper;
+it runs its own script (`src/Misc/expressionFunc/hashFiles/src/hashFiles.ts`) that calls
+`glob.create(patterns, { followSymbolicLinks })` directly, with `followSymbolicLinks`
+**defaulting to `false`** (`@actions/glob`'s own default is `true`) unless the first
+`hashFiles()` argument is the literal string `--follow-symbolic-links`
+(`src/Runner.Worker/Expressions/HashFilesFunction.cs`). Patterns are always resolved
+against `GITHUB_WORKSPACE` — the runner launches the hashFiles subprocess with that as
+its working directory, and `@actions/glob` resolves relative patterns against
+`process.cwd()`, regardless of any `working-directory:` set on the step. Matched
+directories, and anything outside the workspace, are excluded, matching the runner's own
+filtering.
+
+## Limitations
+
+- Only literal string-argument patterns are evaluated. A pattern built from `format()`,
+  `matrix.*`, or any other expression is not — there is no way to know its value without
+  running the workflow.
+- Line numbers point at the start of the YAML scalar containing a `hashFiles()` call, not
+  the exact sub-line inside a multi-line block scalar (a folded `restore-keys: |` with
+  several lines, for instance).
+- `lockfile-manager-mismatch` only recognizes `setup-node`'s `cache:` input,
+  `pnpm/action-setup`, `oven-sh/setup-bun`, and `package.json`'s `packageManager` field. A
+  workflow that installs a package manager another way gives no signal, and the rule is
+  silently skipped rather than guessing.
+- The commented-out-line check for `hashFiles(` occurrences is a heuristic (tracks quotes,
+  looks for a `#` preceded by whitespace or start-of-line), not a full YAML tokenizer; an
+  unusual quoting style could fool it either way.
+- Does not fetch or evaluate `uses: ./local-composite-action` targets differently from any
+  other file — they are found and linted the same way as top-level workflows, but nothing
+  cross-references a workflow's call site to the action's own inputs.
+- No submodule or `LFS` pointer awareness: a pattern that only matches an LFS pointer file
+  is treated the same as matching the real content, same as the runner itself would.
+
+## Compatibility
+
+Tested on macOS (Darwin), Node 24.20.0 (the TypeScript suite) and the built `dist/`
+against Node 24.20.0. The CI workflow in this repo also runs the smoke tests against Node
+20.6 and 22 in GitHub's `ubuntu-latest`, but that is "runs in CI", not something run
+locally.
+
+## Development
+
+```sh
+npm install
+npx tsc --noEmit               # typecheck
+node --test "test/*.test.ts"   # full suite, needs node 24+ for type stripping
+npm run build && npm run test:dist   # what CI also runs against node 20 and 22
+```
+
+## License
+
+MIT

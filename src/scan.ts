@@ -4,6 +4,7 @@ import type { Node, YAMLMap } from 'yaml';
 import { findHashFilesCalls, type HashFilesCall } from './expr.ts';
 import { evaluateHashFilesPatterns, InvalidPatternError } from './glob-eval.ts';
 import { detectPackageManager, lockfileOwner, literalBasename } from './package-manager.ts';
+import { findNearMiss, literalDirname } from './near-miss.ts';
 import type { Finding } from './types.ts';
 
 export class YamlParseError extends Error {}
@@ -12,6 +13,13 @@ export interface StepContext {
   uses?: string;
   with?: Record<string, string>;
   withLines?: Record<string, number>;
+  /** Identifies the `steps:` array this step belongs to (a job or a composite action's `runs`), so order comparisons never cross jobs. */
+  stepsListId?: number;
+  /** Position within that steps array. */
+  index?: number;
+  hasRun: boolean;
+  runText?: string;
+  runLine?: number;
 }
 
 interface CallSite {
@@ -30,7 +38,7 @@ function keyNameOf(key: unknown): string | undefined {
   return isScalar(key) && typeof key.value === 'string' ? key.value : undefined;
 }
 
-/** Walks a workflow or composite-action YAML document, collecting every `hashFiles()` call site and every step's `uses`/`with`. Works uniformly for `jobs.*.steps[]` and a composite action's `runs.steps[]` — both are just maps with a `uses` or `run` key. */
+/** Walks a workflow or composite-action YAML document, collecting every `hashFiles()` call site and every step's `uses`/`with`/`run`. Works uniformly for `jobs.*.steps[]` and a composite action's `runs.steps[]` — both are just a `steps:` array of maps with a `uses` or `run` key. */
 export function collectCallSites(text: string): Collected {
   const lineCounter = new LineCounter();
   const doc = parseDocument(text, { lineCounter });
@@ -40,8 +48,15 @@ export function collectCallSites(text: string): Collected {
 
   const callSites: CallSite[] = [];
   const steps: StepContext[] = [];
+  let stepsListCounter = 0;
 
-  function walk(node: Node | null | undefined, fieldPath: string[], step: StepContext | undefined): void {
+  function walk(
+    node: Node | null | undefined,
+    fieldPath: string[],
+    step: StepContext | undefined,
+    stepsListId?: number,
+    index?: number,
+  ): void {
     if (!node) return;
     if (isMap(node)) {
       let currentStep = step;
@@ -62,6 +77,13 @@ export function collectCallSites(text: string): Collected {
             }
           }
         }
+        let runText: string | undefined;
+        let runLine: number | undefined;
+        if (runPair && isScalar(runPair.value) && typeof runPair.value.value === 'string') {
+          runText = runPair.value.value;
+          const range = runPair.value.range;
+          if (range) runLine = lineCounter.linePos(range[0]).line;
+        }
         currentStep = {
           uses:
             usesPair && isScalar(usesPair.value) && typeof usesPair.value.value === 'string'
@@ -69,16 +91,28 @@ export function collectCallSites(text: string): Collected {
               : undefined,
           with: withMap,
           withLines,
+          stepsListId,
+          index,
+          hasRun: runPair !== undefined,
+          runText,
+          runLine,
         };
         steps.push(currentStep);
       }
       for (const pair of map.items) {
         const keyName = keyNameOf(pair.key);
-        walk(
-          pair.value as Node | null,
-          keyName !== undefined ? [...fieldPath, keyName] : fieldPath,
-          currentStep,
-        );
+        if (keyName === 'steps' && isSeq(pair.value)) {
+          const listId = ++stepsListCounter;
+          pair.value.items.forEach((item, idx) => {
+            walk(item as Node | null, [...fieldPath, 'steps', `[${idx}]`], currentStep, listId, idx);
+          });
+        } else {
+          walk(
+            pair.value as Node | null,
+            keyName !== undefined ? [...fieldPath, keyName] : fieldPath,
+            currentStep,
+          );
+        }
       }
     } else if (isSeq(node)) {
       node.items.forEach((item, idx) => {
@@ -141,6 +175,37 @@ function findStaticCacheKeys(steps: StepContext[], file: string): Finding[] {
     }
   }
   return out;
+}
+
+/** A keyword that would show up in a `run:` step generating this lockfile, for a stronger "which earlier step" signal. */
+const TOOL_KEYWORDS: Array<{ basenames: RegExp; keyword: RegExp }> = [
+  { basenames: /^composer\.lock$/i, keyword: /\bcomposer\b/i },
+  { basenames: /^(package-lock\.json|npm-shrinkwrap\.json)$/i, keyword: /\bnpm\b/i },
+  { basenames: /^yarn\.lock$/i, keyword: /\byarn\b/i },
+  { basenames: /^pnpm-lock\.yaml$/i, keyword: /\bpnpm\b/i },
+  { basenames: /^bun\.lockb?$/i, keyword: /\bbun\b/i },
+  { basenames: /^go\.sum$/i, keyword: /\bgo\b/i },
+  { basenames: /^Cargo\.lock$/i, keyword: /\bcargo\b/i },
+  { basenames: /^poetry\.lock$/i, keyword: /\bpoetry\b/i },
+  { basenames: /^uv\.lock$/i, keyword: /\buv\b/i },
+  { basenames: /^requirements.*\.txt$/i, keyword: /\bpip-compile\b|\bpip\b/i },
+];
+
+function findGeneratingStep(
+  basename: string | undefined,
+  earlierRunSteps: StepContext[],
+): { step: StepContext; confident: boolean } | undefined {
+  if (earlierRunSteps.length === 0) return undefined;
+  if (basename) {
+    const rule = TOOL_KEYWORDS.find((r) => r.basenames.test(basename));
+    if (rule) {
+      const match = earlierRunSteps.find((s) => s.runText && rule.keyword.test(s.runText));
+      if (match) return { step: match, confident: true };
+    }
+  }
+  // No keyword match (or no fixed basename to key off of) — fall back to the
+  // closest preceding run step as a weaker signal.
+  return { step: earlierRunSteps[earlierRunSteps.length - 1]!, confident: false };
 }
 
 /** Lints one workflow or composite-action file's text. `workspace` is the repository root that patterns resolve against (mirrors GITHUB_WORKSPACE) — never a step's `working-directory`, which the runner's hashFiles ignores. */
@@ -211,15 +276,54 @@ export async function lintText(file: string, text: string, workspace: string): P
     }
 
     if (result.matchedFiles.length === 0) {
-      findings.push({
-        rule: 'matches-nothing',
-        severity: 'error',
-        file,
-        line: site.line,
-        message: `hashFiles(${quoteArgs(literalPatterns)}) matches no files — it resolves to '' and${
-          keyField ? ' the cache key becomes constant' : ' the expression is always empty'
-        }.`,
-      });
+      // A step earlier in the same job/composite-action might generate the
+      // file this pattern names (e.g. `composer update` before a cache step
+      // keyed on `composer.lock`) — if so this isn't wrong, just a checkout-
+      // time false alarm, and should read as a warning, not an error.
+      const earlierRunSteps =
+        site.step?.stepsListId !== undefined && site.step.index !== undefined
+          ? steps.filter(
+              (s) =>
+                s.stepsListId === site.step!.stepsListId &&
+                s.index !== undefined &&
+                s.index < site.step!.index! &&
+                s.hasRun,
+            )
+          : [];
+      const singlePattern = literalPatterns.length === 1 ? literalPatterns[0]! : undefined;
+      const basename = singlePattern ? literalBasename(singlePattern) : undefined;
+      const generating = findGeneratingStep(basename, earlierRunSteps);
+
+      let hint = '';
+      const dir = singlePattern ? literalDirname(singlePattern) : undefined;
+      if (basename && dir !== undefined) {
+        const nearMiss = findNearMiss(basename, dir, workspace);
+        if (nearMiss) hint = ` Did you mean '${dir ? `${dir}/${nearMiss}` : nearMiss}'?`;
+      }
+
+      if (generating) {
+        const line = generating.step.runLine ?? '?';
+        const source = generating.confident
+          ? `it only exists once the earlier step at line ${line} generates it`
+          : `it may be generated by the earlier run step at line ${line} (unconfirmed — that step doesn't obviously name the tool)`;
+        findings.push({
+          rule: 'matches-nothing',
+          severity: 'warning',
+          file,
+          line: site.line,
+          message: `hashFiles(${quoteArgs(literalPatterns)}) matches no file currently in the checkout — ${source}. If it never appears, the cache key is constant.${hint}`,
+        });
+      } else {
+        findings.push({
+          rule: 'matches-nothing',
+          severity: 'error',
+          file,
+          line: site.line,
+          message: `hashFiles(${quoteArgs(literalPatterns)}) matches no files — it resolves to '' and${
+            keyField ? ' the cache key becomes constant' : ' the expression is always empty'
+          }.${hint}`,
+        });
+      }
       continue;
     }
 

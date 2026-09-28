@@ -63,3 +63,41 @@ test('reports the correct line number for a matches-nothing finding', async () =
   const finding = report.findings.find((f) => f.rule === 'matches-nothing')!;
   assert.equal(finding.line, 11); // the `key:` line in the fixture workflow
 });
+
+test('generated-file: an earlier run step in the same job downgrades matches-nothing to a warning', async () => {
+  const report = await lintPath(fixture('generated-file'));
+  const findings = report.findings.filter((f) => f.rule === 'matches-nothing');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]!.severity, 'warning');
+  assert.match(findings[0]!.message, /composer\.lock/);
+  assert.match(findings[0]!.message, /line 8/); // the `run: composer update` line
+});
+
+test('generated-file-after: a run step AFTER the hashFiles use does not downgrade — stays an error', async () => {
+  const report = await lintPath(fixture('generated-file-after'));
+  const findings = report.findings.filter((f) => f.rule === 'matches-nothing');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0]!.severity, 'error');
+});
+
+test('near-miss: bun.lockb absent but bun.lock present in the same directory gets a "did you mean" hint', async () => {
+  const report = await lintPath(fixture('near-miss-bun'));
+  const findings = report.findings.filter((f) => f.rule === 'matches-nothing');
+  assert.equal(findings.length, 1);
+  assert.match(findings[0]!.message, /Did you mean 'bun\.lock'\?/);
+});
+
+test('paths are reported relative to the analysed root, never a "../" chain, when run from elsewhere', async () => {
+  const priorCwd = process.cwd();
+  process.chdir('/');
+  try {
+    const report = await lintPath(fixture('matches-nothing'));
+    assert.equal(report.findings.length > 0, true);
+    for (const f of report.findings) {
+      assert.equal(f.file.includes('..'), false, `unexpected '..' in reported path: ${f.file}`);
+    }
+    assert.equal(report.findings[0]!.file, path.join('.github', 'workflows', 'test.yml'));
+  } finally {
+    process.chdir(priorCwd);
+  }
+});

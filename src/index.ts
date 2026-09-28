@@ -35,13 +35,20 @@ export async function lintPath(target: string, workspace?: string): Promise<Lint
   // checks) must start from the same realpath, not a caller-supplied one
   // that might contain a symlink component (e.g. macOS's /tmp).
   const ws = fs.realpathSync(path.resolve(workspace ?? (stat.isDirectory() ? target : process.cwd())));
+  // Reported file paths are relative to the analysed root, not the process's
+  // cwd — running `hashfiles-lint /abs/path/to/repo` from somewhere else
+  // must never print a `../../../..` chain. `root` deliberately is not
+  // realpath'd: `files` below were resolved with plain path.resolve too, so
+  // both sides of the path.relative() call agree regardless of any symlink
+  // in `target`.
+  const root = stat.isDirectory() ? path.resolve(target) : path.dirname(path.resolve(target));
 
   const findings: Finding[] = [];
   const errors: FileError[] = [];
   const scannedFiles: string[] = [];
 
   for (const file of files) {
-    const relFile = path.relative(process.cwd(), file) || file;
+    const relFile = path.relative(root, file) || path.basename(file);
     let text: string;
     try {
       text = fs.readFileSync(file, 'utf8');
